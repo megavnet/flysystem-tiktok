@@ -31,6 +31,7 @@ use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7;
+use GuzzleHttp\Psr7\Response;
 use InvalidArgumentException;
 use League\Flysystem\UnableToCheckExistence;
 use League\Flysystem\UnableToListContents;
@@ -152,37 +153,44 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    public function putMany(array $files, bool $throw = true)
+    public function putMany(array $files, array $options = []): array
     {
-        $promises = [];
-        foreach ($files as $file_path) {
-            $mimeType = $this->mimeTypeDetector->detectMimeTypeFromPath($file_path);
-            if ($mimeType === 'image/jpeg' || $mimeType === 'image/png') {
-                $promises[] = $this->uploadImage($file_path, null, [], false);
-            } else {
-                throw UnableToWriteFile::atLocation($file_path, 'Unsupported file type: ' . $mimeType);
+        $requests = function () use ($files) {
+            foreach ($files as $file_path) {
+                yield function() use ($file_path) {
+                    return $this->uploadImage($file_path, null, [], false);
+                };
             }
-        }
+        };
+        $responses = [];
+        $pool = new \GuzzleHttp\Pool($this->client, $requests(), [
+            'concurrency' => $options['concurrency'] ?? 5,
+            'fulfilled' => function (Response $response, $index) use (&$responses) {
+                // this is delivered each successful response
+                $responses[$index] = $response;
+                return;
+            },
+            'rejected' => function (RequestException $reason, $index) use (&$responses) {
+                // this is delivered each failed request
+                $responses[$index] = $reason;
+                return;
+            },
+        ]);
+        // Initiate the transfers and create a promise
+        $promise = $pool->promise();
+        // Force the pool of requests to complete.
+        $promise->wait();
         $results = [];
-        if ($throw) {
-            $responses = \GuzzleHttp\Promise\Utils::unwrap($promises);
-            foreach ($responses as $index => $response) {
-                $body = json_decode($response->getBody(), true);
-                if (isset($body['data']) && !empty($body['data'])) {
-                    $results[$index] = $body['data'];
-                } else {
-                    $message = $body['message'] ?? 'Unknown error';
+        foreach ($responses as $index => $response) {
+            $body = $response instanceof Response ? json_decode($response->getBody(), true) : [];
+            if (isset($body['data']) && !empty($body['data'])) {
+                $results[$index] = $body['data'];
+            } else {
+                $message = $body['message'] ?? 'Unknown error';
+                if ($options['throw'] ?? true) {
                     throw new TikTokRequestException('Failed to upload image: ' . $message, $body);
-                }
-            }
-        } else {
-            $responses = \GuzzleHttp\Promise\Utils::settle($promises)->wait();
-            foreach ($responses as $index => $response) {
-                $body = $response['state'] === 'fulfilled' ? json_decode($response['value']->getBody(), true) : [];
-                if (isset($body['data']) && !empty($body['data'])) {
-                    $results[] = $body['data'];
                 } else {
-                    $message = $body['message'] ?? 'Unknown error';
+                    $results[$index] = null;
                 }
             }
         }
