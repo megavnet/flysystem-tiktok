@@ -142,7 +142,10 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             if ($mimeType === 'image/jpeg' || $mimeType === 'image/png') {
                 $response = $this->uploadImage($file_name, $contents, $options);
                 $url = $response['url'] ?? $response['image_url'];
-                $url = $this->transformImageUrl($url);
+                if (!isset($options['transform_image_url']) || $options['transform_image_url']) {
+                    $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : 'p21';
+                    $url = $this->transformImageUrl($url, $sub_domain);
+                }
                 return $url;
             } elseif ($mimeType === 'video/mp4') {
                 $response = $this->uploadVideo($file_name, $contents, $options);
@@ -173,7 +176,10 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
                 $body = json_decode($response->getBody(), true);
                 if (isset($body['data']) && !empty($body['data'])) {
                     $url = $body['data']['url'] ?? $body['data']['image_url'];
-                    $url = $this->transformImageUrl($url);
+                    if (!isset($options['transform_image_url']) || $options['transform_image_url']) {
+                        $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : 'p21';
+                        $url = $this->transformImageUrl($url, $sub_domain);
+                    }
                     $responses[$index] = $url;
                 } else {
                     $responses[$index] = $body['message'] ?? $body['msg'] ?? 'Unknown error';
@@ -414,10 +420,11 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         return $value;
     }
 
-    function transformImageUrl($url) {
+    function transformImageUrl($url, $sub_domain) {
         return preg_replace_callback(
             '#^https://(p\d+)-ad-site-sign-(\w+)\.ibyteimg\.com/([^/]+)/([^~]+)~[^?]+\?.*$#',
-            function($matches) {
+            function($matches) use ($sub_domain) {
+                $matches[1] = $sub_domain; // other as p19 will be blocked by tiktok: 403
                 $subdomain = "{$matches[1]}-ad-{$matches[2]}";
                 $bucket = $matches[3];
                 $object = $matches[4];
