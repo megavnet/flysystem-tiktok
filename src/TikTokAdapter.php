@@ -29,6 +29,7 @@ use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\Psr7;
 use InvalidArgumentException;
 use League\Flysystem\UnableToCheckExistence;
@@ -133,7 +134,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
      * @throws Exception
      * @throws UnableToWriteFile
      */
-    public function put($file_name, $contents)
+    public function put($file_name, $contents = null)
     {
         try {
             $mimeType = $this->mimeTypeDetector->detectMimeTypeFromPath($file_name) ?: $this->mimeTypeDetector->detectMimeTypeFromBuffer($contents);
@@ -151,32 +152,54 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    protected function uploadImage(string $file_path, ?string $contents, ?array $options = []): array
+    public function putMany(array $files, bool $throw = true)
     {
-        if ($this->useCookie) {
-            return $this->uploadImageUseCookie($file_path, $contents, $options);
-        } else {
-            return $this->uploadImageUseAccessToken($file_path, $contents, $options);
+        $promises = [];
+        foreach ($files as $file_path) {
+            $mimeType = $this->mimeTypeDetector->detectMimeTypeFromPath($file_path);
+            if ($mimeType === 'image/jpeg' || $mimeType === 'image/png') {
+                $promises[] = $this->uploadImage($file_path, null, [], false);
+            } else {
+                throw UnableToWriteFile::atLocation($file_path, 'Unsupported file type: ' . $mimeType);
+            }
         }
+        $results = [];
+        if ($throw) {
+            $responses = \GuzzleHttp\Promise\Utils::unwrap($promises);
+            foreach ($responses as $index => $response) {
+                $body = json_decode($response->getBody(), true);
+                if (isset($body['data']) && !empty($body['data'])) {
+                    $results[$index] = $body['data'];
+                } else {
+                    $message = $body['message'] ?? 'Unknown error';
+                    throw new TikTokRequestException('Failed to upload image: ' . $message, $body);
+                }
+            }
+        } else {
+            $responses = \GuzzleHttp\Promise\Utils::settle($promises)->wait();
+            foreach ($responses as $index => $response) {
+                $body = $response['state'] === 'fulfilled' ? json_decode($response['value']->getBody(), true) : [];
+                if (isset($body['data']) && !empty($body['data'])) {
+                    $results[] = $body['data'];
+                } else {
+                    $message = $body['message'] ?? 'Unknown error';
+                }
+            }
+        }
+        return $results;
     }
 
-    protected function uploadImageUseCookie(string $file_path, ?string $contents, ?array $options = []): array
+    protected function uploadImage(string $file_path, ?string $contents, ?array $options = [], bool $wait = true): array|PromiseInterface
     {
-        $multipart = [
-            [
-                'name'     => 'Filedata',
-                'contents' => $contents ?? Psr7\Utils::tryFopen($file_path, 'r'),
-                'filename' => basename($file_path),
-            ],
-        ];
-
-        $response = $this->client->request('POST', 'https://ads.tiktok.com/mi/api/v2/i18n/material/image/upload/', [
-            'query' => [
-                'aadvid' => $this->config['advertiser_id'],
-                'Content-Type' => 'multipart/form-data',
-            ],
-            'multipart' => $multipart,
-        ]);
+        if ($this->useCookie) {
+            $promise = $this->uploadImageUseCookie($file_path, $contents, $options);
+        } else {
+            $promise = $this->uploadImageUseAccessToken($file_path, $contents, $options);
+        }
+        if (!$wait) {
+            return $promise;
+        }
+        $response = $promise->wait();
         $body = json_decode($response->getBody(), true);
         if (isset($body['data']) && !empty($body['data'])) {
             return $body['data'];
@@ -186,8 +209,30 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    protected function uploadImageUseAccessToken(string $file_path, ?string $contents, ?array $options = []): array
+    protected function uploadImageUseCookie(string $file_path, ?string $contents, ?array $options = []): PromiseInterface
     {
+        $contents = $contents ?: Psr7\Utils::tryFopen($file_path, 'r');
+        $multipart = [
+            [
+                'name'     => 'Filedata',
+                'contents' => $contents,
+                'filename' => basename($file_path),
+            ],
+        ];
+
+        $promise = $this->client->requestAsync('POST', 'https://ads.tiktok.com/mi/api/v2/i18n/material/image/upload/', [
+            'query' => [
+                'aadvid' => $this->config['advertiser_id'],
+                'Content-Type' => 'multipart/form-data',
+            ],
+            'multipart' => $multipart,
+        ]);
+        return $promise;
+    }
+
+    protected function uploadImageUseAccessToken(string $file_path, ?string $contents, ?array $options = []): PromiseInterface
+    {
+        $contents = $contents ?: file_get_contents($file_path);
         $multipart = [
             [
                 'name'     => 'advertiser_id',
@@ -195,7 +240,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             ],
             [
                 'name'     => 'image_file',
-                'contents' => $contents ?? Psr7\Utils::tryFopen($file_path, 'r')
+                'contents' => $contents
             ],
             [
                 'name'     => 'upload_type',
@@ -203,7 +248,8 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             ],
             [
                 'name'     => 'image_signature',
-                'contents' => md5($contents),
+                // $contents maybe a stream, so we need to get md5 from stream
+                'contents' => is_string($contents) ? md5($contents) : md5_file($file_path),
             ]
         ];
 
@@ -214,16 +260,10 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             ];
         }
 
-        $response = $this->client->request('POST', 'file/image/ad/upload/', [
+        $promise = $this->client->requestAsync('POST', 'file/image/ad/upload/', [
             'multipart' => $multipart,
         ]);
-        $body = json_decode($response->getBody(), true);
-        if (isset($body['data']) && !empty($body['data'])) {
-            return $body['data'];
-        } else {
-            $message = $body['message'] ?? 'Unknown error';
-            throw new TikTokRequestException('Failed to upload image: ' . $message, $body);
-        }
+        return $promise;
     }
 
     /**
