@@ -1,0 +1,51 @@
+{
+    "name": "megavn/flysystem-tiktok",
+    "description": "Flysystem Adapter for the TikTok",
+    "keywords": [
+        "flysystem-tiktok",
+        "flysystem",
+        "tiktok",
+        "laravel"
+    ],
+    "homepage": "https://github.com/megavnet/flysystem-tiktok",
+    "license": "MIT",
+    "authors": [],
+    "require": {
+        "php": "^8.0",
+        "guzzlehttp/guzzle": "^6.2|^7.0",
+        "league/flysystem": "^3.7.0",
+        "illuminate/support": "^9|^10|^11|^12",
+        "symfony/cache": "^6.0"
+    },
+    "require-dev": {
+        "pestphp/pest": "^1.22",
+        "phpspec/prophecy-phpunit": "^2.0.1",
+        "phpunit/phpunit": "^9.5.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Megavn\\FlysystemTikTok\\": "src"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Megavn\\FlysystemTikTok\\Test\\": "tests"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Megavn\\FlysystemTikTok\\TikTokServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    }
+}
