@@ -33,6 +33,8 @@ use GuzzleHttp\Psr7;
 use InvalidArgumentException;
 use League\Flysystem\UnableToCheckExistence;
 use League\Flysystem\UnableToListContents;
+use Psr\Cache\InvalidArgumentException as CacheInvalidArgumentException;
+use Random\RandomException;
 use Symfony\Component\Cache\Adapter\FilesystemAdapter as CacheAdapter;
 use Symfony\Contracts\Cache\ItemInterface;
 
@@ -46,24 +48,30 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
 
     protected CacheAdapter $cache;
 
+    protected bool $useCookie = false;
+
     public function __construct(
         array $config,
         ?MimeTypeDetector $mimeTypeDetector = null
     ) {
         $this->config = $config;
         $this->cache = new CacheAdapter();
-        if (!isset($this->config['access_token'])) {
-            throw new InvalidArgumentException('Access token is required');
+        if (!isset($this->config['access_token']) && !isset($this->config['cookie'])) {
+            throw new InvalidArgumentException('Access token or cookie is required');
         }
         if (!isset($this->config['base_uri'])) {
-            $this->config['base_uri'] = 'https://business-api.tiktok.com/open_api/v1.3/';
+            if (isset($this->config['access_token'])) {
+                $this->config['base_uri'] = 'https://business-api.tiktok.com/open_api/v1.3/';
+            } else {
+                $this->config['base_uri'] = 'https://ads.tiktok.com/';
+            }
         }
 
         $this->client = $this->getClient();
         if (!isset($this->config['advertiser_id'])) {
-            $advertisers = $this->getAdvertisers();
-            if (count($advertisers) > 0) {
-                $this->config['advertiser_id'] = $advertisers[0]['advertiser_id'];
+            $advertiser_id = $this->getAdvertiserId();
+            if ($advertiser_id) {
+                $this->config['advertiser_id'] = $advertiser_id;
             } else {
                 throw new InvalidArgumentException('Not found any advertisers');
             }
@@ -74,21 +82,44 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
 
     public function getClient(): GuzzleClient
     {
-        $client = new GuzzleClient([
+        if (isset($this->config['cookie'])) {
+            $this->useCookie = true;
+            // convert cookie string to array
+            $cookies = [];
+            $cookieArray = array_filter(array_map('trim', explode(';', $this->config['cookie'])));
+            foreach ($cookieArray as $item) {
+                $parts = explode('=', $item);
+                if (count($parts) === 2) {
+                    $cookies[$parts[0]] = $parts[1];
+                } else if (count($parts) === 1) {
+                    $cookies['sessionid_ss_ads'] = $parts[0];
+                }
+            }
+            if (!isset($cookies['csrftoken'])) {
+                throw new TikTokRequestException('The cookie csrftoken is required');
+                // $cookies['csrftoken'] = $this->getCsrfToken(\GuzzleHttp\Cookie\CookieJar::fromArray($cookies, 'business.tiktok.com'));
+            }
+            if (!isset($cookies['sessionid_ss_ads'])) {
+                throw new TikTokRequestException('The cookie sessionid_ss_ads is required');
+            }
+            $jar = \GuzzleHttp\Cookie\CookieJar::fromArray($cookies, 'ads.tiktok.com');
+        } else {
+            $jar = null;
+        }
+        $client_options = [
             'base_uri' => $this->config['base_uri'],
             'headers' => [
-                'Access-Token' => $this->config['access_token'],
-                'Content-Type' => 'application/json',
+                // if access_token is set, use it, otherwise use cookie
+                'Access-Token' => $this->config['access_token'] ?? '',
+                'x-csrftoken' => $cookies['csrftoken'] ?? '',
+                // 'Content-Type' => 'application/json',
                 'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             ],
-        ]);
+            'cookies' => $jar,
+        ];
+        $client = new GuzzleClient($client_options);
 
         return $client;
-    }
-
-    public function fileExists(string $path): bool
-    {
-        throw UnableToCheckExistence::forLocation($path, new Exception('Adapter does not support file existence check.'));
     }
 
     /**
@@ -120,24 +151,42 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    public function write(string $file_name, string $contents, Config $config): void
+    protected function uploadImage(string $file_path, ?string $contents, ?array $options = []): array
     {
-        throw UnableToWriteFile::atLocation($file_name, 'Adapter does not support file writing.');
+        if ($this->useCookie) {
+            return $this->uploadImageUseCookie($file_path, $contents, $options);
+        } else {
+            return $this->uploadImageUseAccessToken($file_path, $contents, $options);
+        }
     }
 
-    /**
-     *
-     * @param string $file_name
-     * @param string $contents
-     * @param array $options
-     * @return array
-     * @throws GuzzleException
-     * @throws Exception
-     */
-    protected function uploadImage(string $file_path, ?string $contents, ?array $options = []): array
+    protected function uploadImageUseCookie(string $file_path, ?string $contents, ?array $options = []): array
+    {
+        $multipart = [
+            [
+                'name'     => 'Filedata',
+                'contents' => $contents ?? Psr7\Utils::tryFopen($file_path, 'r'),
+                'filename' => basename($file_path),
+            ],
+        ];
+
+        $response = $this->client->request('POST', 'https://ads.tiktok.com/mi/api/v2/i18n/material/image/upload/', [
+            'query' => [
+                'aadvid' => $this->config['advertiser_id'],
+                'Content-Type' => 'multipart/form-data',
+            ],
+            'multipart' => $multipart,
+        ]);
+        $body = json_decode($response->getBody(), true);
+        if (isset($body['data']) && !empty($body['data'])) {
+            return $body['data'];
+        } else {
+            $message = $body['message'] ?? 'Unknown error';
+            throw new TikTokRequestException('Failed to upload image: ' . $message, $body);
+        }
+    }
+
+    protected function uploadImageUseAccessToken(string $file_path, ?string $contents, ?array $options = []): array
     {
         $multipart = [
             [
@@ -264,26 +313,72 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    protected function getAdvertisers()
+    protected function getAdvertiserId(): string
     {
-        if (!isset($this->config['app_id']) || !isset($this->config['secret'])) {
+        if (!$this->useCookie && (!isset($this->config['app_id']) || !isset($this->config['app_secret']))) {
             throw new InvalidArgumentException('App ID and secret are required for get advertisers');
         }
 
-        $cacheKey = 'tiktok_advertisers_' . $this->config['app_id'] . '_' . $this->config['secret'];
+        $cacheKey = $this->useCookie ? 'tiktok_advertisers_cookie_' . md5($this->config['cookie']) : 'tiktok_advertiser_' . $this->config['app_id'] . '_' . $this->config['app_secret'];
 
-        $value = $this->cache->get($cacheKey, function (ItemInterface $item): array {
-            $response = $this->client->request('GET', 'oauth2/advertiser/get/', [
-                'query' => [
-                    'app_id' => $this->config['app_id'],
-                    'secret' => $this->config['secret'],
-                ]
-            ]);
-            $body = json_decode($response->getBody(), true);
+        $value = $this->cache->get($cacheKey, function (ItemInterface $item): string {
+            if ($this->useCookie) {
+                $response = $this->client->request('GET', 'https://ads.tiktok.com/api/v4/i18n/account/permission/detail/');
+                $body = json_decode($response->getBody(), true);
+                $data = $body['data']['account']['id'] ?? '';
+            } else {
+                $response = $this->client->request('GET', 'oauth2/advertiser/get/', [
+                    'query' => [
+                        'app_id' => $this->config['app_id'],
+                        'secret' => $this->config['app_secret'],
+                    ]
+                ]);
+                $body = json_decode($response->getBody(), true);
+                $data = $body['data']['list'][0]['advertiser_id'] ?? '';
+            }
             $item->expiresAfter(60 * 60 * 24);
-            return $body['data']['list'] ?? [];
+            return $data;
         });
         return $value;
+    }
+
+    /**
+     * Not working, need to fix
+     * @param mixed $jar
+     * @return string
+     * @throws *2dcb3860
+     * @throws CacheInvalidArgumentException
+     * @throws RandomException
+     */
+    protected function getCsrfToken($jar): string
+    {
+        $value = $this->cache->get('tiktok_csrf_token', function (ItemInterface $item) use ($jar): string {
+            $client = new GuzzleClient([
+                'cookies' => $jar,
+                'headers' => [
+                    'Referer' => 'https://ads.tiktok.com',
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ],
+            ]);
+            $response = $client->request('GET', 'https://business.tiktok.com/api/bff/v3/bm/setting/csrf-token');
+            $body = json_decode($response->getBody(), true);
+            $item->expiresAfter(60 * 60 * 24);
+            return $body['data']['csrfToken'] ?? '';
+        });
+        return $value;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function write(string $file_name, string $contents, Config $config): void
+    {
+        throw UnableToWriteFile::atLocation($file_name, 'Adapter does not support file writing.');
+    }
+
+    public function fileExists(string $path): bool
+    {
+        throw UnableToCheckExistence::forLocation($path, new Exception('Adapter does not support file existence check.'));
     }
 
     /**
