@@ -135,16 +135,19 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
      * @throws Exception
      * @throws UnableToWriteFile
      */
-    public function put($file_name, $contents = null)
+    public function put($file_name, $contents = null, array $options = [])
     {
         try {
             $mimeType = $this->mimeTypeDetector->detectMimeTypeFromPath($file_name) ?: $this->mimeTypeDetector->detectMimeTypeFromBuffer($contents);
             if ($mimeType === 'image/jpeg' || $mimeType === 'image/png') {
-                $response = $this->uploadImage($file_name, $contents);
-                return $response;
+                $response = $this->uploadImage($file_name, $contents, $options);
+                $url = $response['url'] ?? $response['image_url'];
+                $url = $this->transformImageUrl($url);
+                return $url;
             } elseif ($mimeType === 'video/mp4') {
-                $response = $this->uploadVideo($file_name, $contents);
-                return $response;
+                $response = $this->uploadVideo($file_name, $contents, $options);
+                $url = $response['preview_url'] ?? '';
+                return $url;
             } else {
                 throw UnableToWriteFile::atLocation($file_name, 'Unsupported file type: ' . $mimeType);
             }
@@ -156,9 +159,9 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
     public function putMany(array $files, array $options = []): array
     {
         $requests = function () use ($files) {
-            foreach ($files as $file_path) {
-                yield function() use ($file_path) {
-                    return $this->uploadImage($file_path, null, [], false);
+            foreach ($files as $file_name => $contents) {
+                yield function() use ($file_name, $contents) {
+                    return $this->uploadImage($file_name, $contents, [], false);
                 };
             }
         };
@@ -167,12 +170,19 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             'concurrency' => $options['concurrency'] ?? 5,
             'fulfilled' => function (Response $response, $index) use (&$responses) {
                 // this is delivered each successful response
-                $responses[$index] = $response;
+                $body = json_decode($response->getBody(), true);
+                if (isset($body['data']) && !empty($body['data'])) {
+                    $url = $body['data']['url'] ?? $body['data']['image_url'];
+                    $url = $this->transformImageUrl($url);
+                    $responses[$index] = $url;
+                } else {
+                    $responses[$index] = $body['message'] ?? $body['msg'] ?? 'Unknown error';
+                }
                 return;
             },
             'rejected' => function (RequestException $reason, $index) use (&$responses) {
                 // this is delivered each failed request
-                $responses[$index] = ['message' => $reason->getMessage()];
+                $responses[$index] = $reason->getMessage();
                 return;
             },
         ]);
@@ -180,29 +190,16 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         $promise = $pool->promise();
         // Force the pool of requests to complete.
         $promise->wait();
-        $results = [];
-        foreach ($responses as $index => $response) {
-            $body = $response instanceof Response ? json_decode($response->getBody(), true) : $response;
-            if (isset($body['data']) && !empty($body['data'])) {
-                $results[$index] = $body['data'];
-            } else {
-                $message = $body['message'] ?? 'Unknown error';
-                if ($options['throw'] ?? true) {
-                    throw new TikTokRequestException('Failed to upload image: ' . $message, $body);
-                } else {
-                    $results[$index] = null;
-                }
-            }
-        }
-        return $results;
+
+        return $responses;
     }
 
-    protected function uploadImage(string $file_path, ?string $contents, ?array $options = [], bool $wait = true): array|PromiseInterface
+    protected function uploadImage(string $file_name, string $contents, ?array $options = [], bool $wait = true): array|PromiseInterface
     {
         if ($this->useCookie) {
-            $promise = $this->uploadImageUseCookie($file_path, $contents, $options);
+            $promise = $this->uploadImageUseCookie($file_name, $contents, $options);
         } else {
-            $promise = $this->uploadImageUseAccessToken($file_path, $contents, $options);
+            $promise = $this->uploadImageUseAccessToken($file_name, $contents, $options);
         }
         if (!$wait) {
             return $promise;
@@ -217,14 +214,13 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         }
     }
 
-    protected function uploadImageUseCookie(string $file_path, ?string $contents, ?array $options = []): PromiseInterface
+    protected function uploadImageUseCookie(string $file_name, string $contents, ?array $options = []): PromiseInterface
     {
-        $contents = $contents ?: Psr7\Utils::tryFopen($file_path, 'r');
         $multipart = [
             [
                 'name'     => 'Filedata',
                 'contents' => $contents,
-                'filename' => basename($file_path),
+                'filename' => basename($file_name),
             ],
         ];
 
@@ -238,9 +234,8 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         return $promise;
     }
 
-    protected function uploadImageUseAccessToken(string $file_path, ?string $contents, ?array $options = []): PromiseInterface
+    protected function uploadImageUseAccessToken(string $file_name, string $contents, ?array $options = []): PromiseInterface
     {
-        $contents = $contents ?: file_get_contents($file_path);
         $multipart = [
             [
                 'name'     => 'advertiser_id',
@@ -248,7 +243,8 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             ],
             [
                 'name'     => 'image_file',
-                'contents' => $contents
+                'contents' => $contents,
+                'filename' => basename($file_name),
             ],
             [
                 'name'     => 'upload_type',
@@ -257,14 +253,14 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             [
                 'name'     => 'image_signature',
                 // $contents maybe a stream, so we need to get md5 from stream
-                'contents' => is_string($contents) ? md5($contents) : md5_file($file_path),
+                'contents' => md5($contents),
             ]
         ];
 
         if (isset($options['include_file_name'])) {
             $multipart[] = [
                 'name'     => 'file_name',
-                'contents' => basename($file_path),
+                'contents' => basename($file_name),
             ];
         }
 
@@ -283,9 +279,11 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
      * @throws GuzzleException
      * @throws Exception
      */
-    protected function uploadVideo(string $file_path, ?string $contents, ?array $options = []): array
+    protected function uploadVideo(string $file_name, string $contents, ?array $options = []): array
     {
-        $contents = $contents ?: Psr7\Utils::tryFopen($file_path, 'r');
+        if ($this->useCookie) {
+            throw new TikTokRequestException('Upload video with cookie is not supported');
+        }
         $multipart = [
             [
                 'name'     => 'advertiser_id',
@@ -294,7 +292,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             [
                 'name'     => 'video_file',
                 'contents' => $contents,
-                'filename' => basename($file_path),
+                'filename' => basename($file_name),
             ],
             [
                 'name'     => 'upload_type',
@@ -325,7 +323,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         if (isset($options['include_file_name'])) {
             $multipart[] = [
                 'name'     => 'file_name',
-                'contents' => basename($file_path),
+                'contents' => basename($file_name),
             ];
         }
 
@@ -414,6 +412,19 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             return $body['data']['csrfToken'] ?? '';
         });
         return $value;
+    }
+
+    function transformImageUrl($url) {
+        return preg_replace_callback(
+            '#^https://(p\d+)-ad-site-sign-(\w+)\.ibyteimg\.com/([^/]+)/([^~]+)~[^?]+\?.*$#',
+            function($matches) {
+                $subdomain = "{$matches[1]}-ad-{$matches[2]}";
+                $bucket = $matches[3];
+                $object = $matches[4];
+                return "https://{$subdomain}.ibyteimg.com/obj/{$bucket}/{$object}";
+            },
+            $url
+        );
     }
 
     /**
