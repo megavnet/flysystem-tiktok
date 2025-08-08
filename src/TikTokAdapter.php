@@ -172,7 +172,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             },
             'rejected' => function (RequestException $reason, $index) use (&$responses) {
                 // this is delivered each failed request
-                $responses[$index] = $reason;
+                $responses[$index] = ['message' => $reason->getMessage()];
                 return;
             },
         ]);
@@ -182,7 +182,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
         $promise->wait();
         $results = [];
         foreach ($responses as $index => $response) {
-            $body = $response instanceof Response ? json_decode($response->getBody(), true) : [];
+            $body = $response instanceof Response ? json_decode($response->getBody(), true) : $response;
             if (isset($body['data']) && !empty($body['data'])) {
                 $results[$index] = $body['data'];
             } else {
