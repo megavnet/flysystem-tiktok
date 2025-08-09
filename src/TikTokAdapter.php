@@ -69,6 +69,10 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             }
         }
 
+        if (!isset($this->config['sub_domain'])) {
+            $this->config['sub_domain'] = 'p21';
+        }
+
         $this->client = $this->getClient();
         if (!isset($this->config['advertiser_id'])) {
             $advertiser_id = $this->getAdvertiserId();
@@ -141,12 +145,19 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
             $mimeType = $this->mimeTypeDetector->detectMimeTypeFromPath($file_name) ?: $this->mimeTypeDetector->detectMimeTypeFromBuffer($contents);
             if ($mimeType === 'image/jpeg' || $mimeType === 'image/png') {
                 $response = $this->uploadImage($file_name, $contents, $options);
-                $url = $response['url'] ?? $response['image_url'];
-                if (!isset($options['transform_image_url']) || $options['transform_image_url']) {
-                    $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : 'p21';
-                    $url = $this->transformImageUrl($url, $sub_domain);
+                $return_type = $options['return_type'] ?? 'url';
+                if ($return_type === 'id' || $return_type === 'image_id') {
+                    return $response['image_id'] ?? '';
                 }
-                return $url;
+                if ($return_type === 'url' || $return_type === 'image_url') {
+                    $url = $response['url'] ?? $response['image_url'];
+                    if (!isset($options['transform_image_url']) || $options['transform_image_url']) {
+                        $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : $this->config['sub_domain'];
+                        $url = $this->transformImageUrl($url, $sub_domain);
+                    }
+                    return $url;
+                }
+                return $response;
             } elseif ($mimeType === 'video/mp4') {
                 $response = $this->uploadVideo($file_name, $contents, $options);
                 $url = $response['preview_url'] ?? '';
@@ -177,7 +188,7 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
                 if (isset($body['data']) && !empty($body['data'])) {
                     $url = $body['data']['url'] ?? $body['data']['image_url'];
                     if (!isset($options['transform_image_url']) || $options['transform_image_url']) {
-                        $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : 'p21';
+                        $sub_domain = isset($options['sub_domain']) ? $options['sub_domain'] : $this->config['sub_domain'];
                         $url = $this->transformImageUrl($url, $sub_domain);
                     }
                     $responses[$index] = $url;
@@ -421,17 +432,16 @@ class TikTokAdapter implements ChecksumProvider, FilesystemAdapter
     }
 
     function transformImageUrl($url, $sub_domain) {
-        return preg_replace_callback(
-            '#^https://(p\d+)-ad-site-sign-(\w+)\.ibyteimg\.com/([^/]+)/([^~]+)~[^?]+\?.*$#',
-            function($matches) use ($sub_domain) {
-                $matches[1] = $sub_domain; // other as p19 will be blocked by tiktok: 403
-                $subdomain = "{$matches[1]}-ad-{$matches[2]}";
-                $bucket = $matches[3];
-                $object = $matches[4];
-                return "https://{$subdomain}.ibyteimg.com/obj/{$bucket}/{$object}";
-            },
-            $url
-        );
+        preg_match('#^https://(p\d+)-ad-site-sign-(\w+)\.ibyteimg\.com/([^/]+)/([^~]+)#', $url, $matches);
+        if (empty($matches) || count($matches) < 5) {
+            return $url;
+        }
+
+        $matches[1] = $sub_domain; // other as p19 will be blocked by tiktok: 403
+        $subdomain = "{$matches[1]}-ad-{$matches[2]}";
+        $bucket = $matches[3];
+        $object = $matches[4];
+        return "https://{$subdomain}.ibyteimg.com/obj/{$bucket}/{$object}";
     }
 
     /**
